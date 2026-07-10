@@ -1,0 +1,53 @@
+name: u_sales_app
+description: U Express KPI Application
+publish_to: 'none'
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  
+  # UI
+  cupertino_icons: ^1.0.6
+  
+  # Network
+  http: ^1.6.0
+  fl_chart: ^0.70.2
+  url_launcher: ^6.2.0 
+  dio: ^5.9.2
+  
+  # Scanner
+  mobile_scanner: ^7.2.0
+  
+  # Biometrics / Fingerprint
+  local_auth: ^2.1.6
+  flutter_secure_storage: ^9.0.0
+  crypto: ^3.0.3
+  
+  # Camera
+  camera: ^0.12.0+1
+  
+  # Utilitaires
+  path_provider: ^2.1.5
+  path: ^1.9.1
+  image_picker: ^1.0.7
+  
+  # Dev 
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_launcher_icons: ^0.13.1
+
+flutter:
+  uses-material-design: true
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: "assets/icon/app_icon.png"
+  adaptive_icon_background: "#06616E"
+  adaptive_icon_foreground: "assets/icon/foreground.png"
