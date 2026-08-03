@@ -34,7 +34,9 @@ dependencies:
   path_provider: ^2.1.5
   path: ^1.9.1
   image_picker: ^1.0.7
-  
+  shared_preferences: ^2.2.2
+  mailer: ^6.0.1  # Pour envoyer des emails SMTP
+
   # Dev 
 
 dev_dependencies:

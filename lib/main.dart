@@ -3,6 +3,9 @@ import 'package:flutter/services.dart';
 import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'package:url_launcher/url_launcher.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:mailer/mailer.dart';
+import 'package:mailer/smtp_server.dart';
 import 'screens/top10_screen.dart';
 import 'screens/produits_u_screen.dart';
 import 'screens/croissance_screen.dart';
@@ -11,10 +14,9 @@ import 'screens/ods_daily_screen.dart';
 import 'screens/stock_scanner_screen.dart';
 import 'screens/magasins_screen.dart';
 import 'screens/stock_rotation_screen.dart';
-import 'screens/fingerprint_enrollment_screen.dart';
 import 'screens/stock_negatif_screen.dart';
 import 'screens/tickets_screen.dart';
-
+import 'dart:math';
 
 void main() {
   runApp(const MyApp());
@@ -43,10 +45,656 @@ class MyApp extends StatelessWidget {
           titleSpacing: 0,
         ),
       ),
-      home: const HomeScreen(),
+      home: const AuthWrapper(),
     );
   }
 }
+
+// ============================================
+// AUTH WRAPPER - Vérifie la session au démarrage
+// ============================================
+
+class AuthWrapper extends StatefulWidget {
+  const AuthWrapper({super.key});
+
+  @override
+  State<AuthWrapper> createState() => _AuthWrapperState();
+}
+
+class _AuthWrapperState extends State<AuthWrapper> {
+  bool _isLoading = true;
+  bool _isLoggedIn = false;
+  String _userEmail = '';
+  String _userName = '';
+
+  @override
+  void initState() {
+    super.initState();
+    _checkSession();
+  }
+
+  Future<void> _checkSession() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      final String? email = prefs.getString('user_email');
+      final String? name = prefs.getString('user_name');
+      final bool? loggedIn = prefs.getBool('is_logged_in');
+
+      setState(() {
+        _isLoggedIn = loggedIn ?? false;
+        _userEmail = email ?? '';
+        _userName = name ?? '';
+        _isLoading = false;
+      });
+
+      print('🔐 Session chargée: $_isLoggedIn - $_userEmail');
+    } catch (e) {
+      print('❌ Erreur chargement session: $e');
+      setState(() {
+        _isLoading = false;
+        _isLoggedIn = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_isLoading) {
+      return const Scaffold(
+        body: Center(
+          child: CircularProgressIndicator(),
+        ),
+      );
+    }
+
+    if (_isLoggedIn && _userEmail.isNotEmpty) {
+      return const HomeScreen();
+    } else {
+      return const LoginScreen();
+    }
+  }
+}
+
+// ============================================
+// SERVICE EMAIL - Configuration SMTP
+// ============================================
+class EmailService {
+  // ✅ Utiliser l'URL ABSOLUE de votre API Vercel
+  static const String _apiUrl = 
+      'https://usales-eta.vercel.app/api/send-otp';
+  
+  // OU si vous avez déployé l'API sur un autre projet
+  // static const String _apiUrl = 
+  //     'https://votre-api.vercel.app/api/send-otp';
+
+  static Future<bool> sendOTPEmail(String toEmail, String otp, String userName) async {
+    try {
+      print('📧 Envoi email à $toEmail...');
+      print('📡 URL: $_apiUrl');
+      
+      final response = await http.post(
+        Uri.parse(_apiUrl),  // ✅ URL absolue
+        headers: {
+          'Content-Type': 'application/json',
+          'Accept': 'application/json',
+        },
+        body: jsonEncode({
+          'email': toEmail,
+          'otp': otp,
+          'name': userName,
+        }),
+      );
+
+      print('📊 Status: ${response.statusCode}');
+      print('📊 Response: ${response.body}');
+
+      if (response.statusCode == 200) {
+        print('✅ Email envoyé avec succès');
+        return true;
+      } else {
+        print('❌ Erreur: ${response.body}');
+        return false;
+      }
+    } catch (e) {
+      print('❌ Erreur: $e');
+      return false;
+    }
+  }
+}
+
+// ============================================
+// ÉCRAN DE LOGIN AVEC OTP
+// ============================================
+
+class LoginScreen extends StatefulWidget {
+  const LoginScreen({super.key});
+
+  @override
+  State<LoginScreen> createState() => _LoginScreenState();
+}
+
+class _LoginScreenState extends State<LoginScreen> {
+  final TextEditingController _emailController = TextEditingController();
+  final TextEditingController _otpController = TextEditingController();
+  final GlobalKey<FormState> _formKey = GlobalKey<FormState>();
+  
+  bool _isLoading = false;
+  bool _isOtpSent = false;
+  bool _isOtpVerified = false;
+  String _generatedOtp = '';
+  String _userName = '';
+  String _errorMessage = '';
+  String _successMessage = '';
+  
+  // URL du fichier users.json sur Gist
+  final String _usersUrl = 'https://gist.githubusercontent.com/RAMZIU/d109d81382fadd8ad0b0bda85565a02c/raw/users.json';
+  
+  List<Map<String, dynamic>> _authorizedUsers = [];
+
+  @override
+  void initState() {
+    super.initState();
+    _loadAuthorizedUsers();
+  }
+
+  // Charger la liste des utilisateurs autorisés depuis Gist
+  Future<void> _loadAuthorizedUsers() async {
+    try {
+      final response = await http.get(Uri.parse(_usersUrl)).timeout(
+        const Duration(seconds: 10),
+      );
+      
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        if (data['users'] != null) {
+          _authorizedUsers = List<Map<String, dynamic>>.from(data['users']);
+          print('👥 ${_authorizedUsers.length} utilisateurs chargés');
+        }
+      }
+    } catch (e) {
+      print('⚠️ Erreur chargement utilisateurs: $e');
+    }
+  }
+
+  // Vérifier si l'email est autorisé
+  bool _isEmailAuthorized(String email) {
+    return _authorizedUsers.any((user) => user['email'] == email);
+  }
+
+  // Générer un OTP à 6 chiffres
+  String _generateOTP() {
+    final random = Random();
+    String otp = '';
+    for (int i = 0; i < 6; i++) {
+      otp += random.nextInt(10).toString();
+    }
+    return otp;
+  }
+
+  // Étape 1: Envoyer l'OTP par email
+  Future<void> _sendOTP() async {
+    if (!_formKey.currentState!.validate()) return;
+    
+    setState(() {
+      _isLoading = true;
+      _errorMessage = '';
+      _successMessage = '';
+    });
+
+    try {
+      final email = _emailController.text.trim();
+      
+      // 1. Vérifier si l'email est autorisé
+      if (!_isEmailAuthorized(email)) {
+        setState(() {
+          _errorMessage = '❌ Email non autorisé. Contactez l\'administrateur.';
+          _isLoading = false;
+        });
+        return;
+      }
+
+      // 2. Récupérer le nom de l'utilisateur
+      final user = _authorizedUsers.firstWhere((u) => u['email'] == email);
+      _userName = user['name'] ?? 'Utilisateur';
+
+      // 3. Générer l'OTP
+      _generatedOtp = _generateOTP();
+      
+      // 4. Envoyer l'OTP par email via SMTP
+      final emailSent = await EmailService.sendOTPEmail(
+        email, 
+        _generatedOtp, 
+        _userName
+      );
+      
+      if (!emailSent) {
+        setState(() {
+          _errorMessage = '❌ Erreur lors de l\'envoi de l\'email. Veuillez réessayer.';
+          _isLoading = false;
+        });
+        return;
+      }
+      
+      setState(() {
+        _isOtpSent = true;
+        _isLoading = false;
+        _successMessage = '✅ Code OTP envoyé à $email';
+      });
+      
+    } catch (e) {
+      setState(() {
+        _errorMessage = '❌ Erreur: ${e.toString()}';
+        _isLoading = false;
+      });
+    }
+  }
+
+  // 🔐 Sauvegarder la session
+  Future<void> _saveSession(String email, String name) async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setString('user_email', email);
+      await prefs.setString('user_name', name);
+      await prefs.setBool('is_logged_in', true);
+      print('✅ Session sauvegardée pour $email');
+    } catch (e) {
+      print('❌ Erreur sauvegarde session: $e');
+    }
+  }
+
+  // Étape 2: Vérifier l'OTP et connecter
+  Future<void> _verifyOTP() async {
+    final enteredOtp = _otpController.text.trim();
+    
+    if (enteredOtp.isEmpty || enteredOtp.length != 6) {
+      setState(() {
+        _errorMessage = '⚠️ Veuillez entrer un code OTP valide (6 chiffres)';
+      });
+      return;
+    }
+
+    if (enteredOtp == _generatedOtp) {
+      setState(() {
+        _isLoading = true;
+        _isOtpVerified = true;
+      });
+      
+      // 🔐 Sauvegarder la session
+      await _saveSession(_emailController.text.trim(), _userName);
+      
+      // Naviguer vers l'écran principal
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(
+          builder: (context) => const HomeScreen(),
+        ),
+      );
+    } else {
+      setState(() {
+        _errorMessage = '❌ Code OTP incorrect. Veuillez réessayer.';
+        _isLoading = false;
+      });
+    }
+  }
+
+  // Réinitialiser le login
+  void _resetLogin() {
+    setState(() {
+      _isOtpSent = false;
+      _isLoading = false;
+      _errorMessage = '';
+      _successMessage = '';
+      _generatedOtp = '';
+      _otpController.clear();
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      body: Container(
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [
+              const Color(0xFF06616E).withOpacity(0.05),
+              Colors.white,
+              const Color(0xFFE22019).withOpacity(0.03),
+            ],
+          ),
+        ),
+        child: SafeArea(
+          child: Center(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(24),
+              child: Card(
+                elevation: 8,
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(24),
+                ),
+                child: Padding(
+                  padding: const EdgeInsets.all(28),
+                  child: Form(
+                    key: _formKey,
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        // Logo
+                        Center(
+                          child: Container(
+                            width: 70,
+                            height: 70,
+                            decoration: BoxDecoration(
+                              gradient: const LinearGradient(
+                                colors: [Color(0xFF06616E), Color(0xFF0A8A9A)],
+                              ),
+                              borderRadius: BorderRadius.circular(20),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: const Color(0xFF06616E).withOpacity(0.3),
+                                  blurRadius: 15,
+                                  offset: const Offset(0, 6),
+                                ),
+                              ],
+                            ),
+                            child: const Icon(
+                              Icons.analytics,
+                              size: 35,
+                              color: Colors.white,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 20),
+                        
+                        Center(
+                          child: Text(
+                            'USALES',
+                            style: TextStyle(
+                              fontSize: 28,
+                              fontWeight: FontWeight.bold,
+                              color: const Color(0xFF06616E),
+                              letterSpacing: -0.5,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        
+                        Center(
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFFE22019).withOpacity(0.1),
+                              borderRadius: BorderRadius.circular(20),
+                            ),
+                            child: const Text(
+                              'Connexion sécurisée',
+                              style: TextStyle(
+                                fontSize: 13,
+                                color: Color(0xFFE22019),
+                                fontWeight: FontWeight.w500,
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 32),
+                        
+                        // Message d'erreur
+                        if (_errorMessage.isNotEmpty)
+                          Container(
+                            padding: const EdgeInsets.all(12),
+                            decoration: BoxDecoration(
+                              color: Colors.red.withOpacity(0.1),
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(color: Colors.red.withOpacity(0.3)),
+                            ),
+                            child: Row(
+                              children: [
+                                const Icon(Icons.error_outline, color: Colors.red, size: 20),
+                                const SizedBox(width: 10),
+                                Expanded(
+                                  child: Text(
+                                    _errorMessage,
+                                    style: const TextStyle(color: Colors.red, fontSize: 13),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        
+                        // Message de succès
+                        if (_successMessage.isNotEmpty)
+                          Container(
+                            padding: const EdgeInsets.all(12),
+                            decoration: BoxDecoration(
+                              color: Colors.green.withOpacity(0.1),
+                              borderRadius: BorderRadius.circular(12),
+                              border: Border.all(color: Colors.green.withOpacity(0.3)),
+                            ),
+                            child: Row(
+                              children: [
+                                const Icon(Icons.check_circle, color: Colors.green, size: 20),
+                                const SizedBox(width: 10),
+                                Expanded(
+                                  child: Text(
+                                    _successMessage,
+                                    style: const TextStyle(color: Colors.green, fontSize: 13),
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        
+                        const SizedBox(height: 16),
+                        
+                        // Champ Email
+                        Text(
+                          'Email professionnel',
+                          style: TextStyle(
+                            fontWeight: FontWeight.bold,
+                            color: const Color(0xFF06616E),
+                            fontSize: 14,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                        TextFormField(
+                          controller: _emailController,
+                          enabled: !_isOtpSent && !_isLoading,
+                          keyboardType: TextInputType.emailAddress,
+                          decoration: InputDecoration(
+                            hintText: 'exemple@entreprise.com',
+                            prefixIcon: const Icon(Icons.email, color: Color(0xFF06616E)),
+                            border: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(12),
+                              borderSide: const BorderSide(color: Colors.grey),
+                            ),
+                            focusedBorder: OutlineInputBorder(
+                              borderRadius: BorderRadius.circular(12),
+                              borderSide: const BorderSide(color: Color(0xFF06616E), width: 2),
+                            ),
+                            filled: true,
+                            fillColor: Colors.grey[50],
+                          ),
+                          validator: (value) {
+                            if (value == null || value.isEmpty) {
+                              return 'Veuillez entrer votre email';
+                            }
+                            if (!value.contains('@') || !value.contains('.')) {
+                              return 'Email invalide';
+                            }
+                            return null;
+                          },
+                        ),
+                        
+                        const SizedBox(height: 16),
+                        
+                        // Champ OTP (visible seulement après envoi)
+                        if (_isOtpSent) ...[
+                          Text(
+                            'Code OTP',
+                            style: TextStyle(
+                              fontWeight: FontWeight.bold,
+                              color: const Color(0xFF06616E),
+                              fontSize: 14,
+                            ),
+                          ),
+                          const SizedBox(height: 8),
+                          Row(
+                            children: [
+                              Expanded(
+                                flex: 3,
+                                child: TextFormField(
+                                  controller: _otpController,
+                                  enabled: !_isLoading,
+                                  keyboardType: TextInputType.number,
+                                  maxLength: 6,
+                                  autofocus: true,
+                                  decoration: InputDecoration(
+                                    hintText: '123456',
+                                    prefixIcon: const Icon(Icons.security, color: Color(0xFF06616E)),
+                                    border: OutlineInputBorder(
+                                      borderRadius: BorderRadius.circular(12),
+                                      borderSide: const BorderSide(color: Colors.grey),
+                                    ),
+                                    focusedBorder: OutlineInputBorder(
+                                      borderRadius: BorderRadius.circular(12),
+                                      borderSide: const BorderSide(color: Color(0xFF06616E), width: 2),
+                                    ),
+                                    filled: true,
+                                    fillColor: Colors.grey[50],
+                                    counterText: '',
+                                  ),
+                                  onChanged: (value) {
+                                    if (value.length == 6) {
+                                      _verifyOTP();
+                                    }
+                                  },
+                                ),
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                flex: 1,
+                                child: TextButton.icon(
+                                  onPressed: _isLoading ? null : _sendOTP,
+                                  icon: const Icon(Icons.refresh, size: 16),
+                                  label: const Text('Re-envoyer'),
+                                  style: TextButton.styleFrom(
+                                    foregroundColor: const Color(0xFF06616E),
+                                    padding: const EdgeInsets.symmetric(vertical: 12),
+                                  ),
+                                ),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 8),
+                          
+                          // Indicateur de temps
+                          Container(
+                            padding: const EdgeInsets.all(10),
+                            decoration: BoxDecoration(
+                              color: Colors.blue.withOpacity(0.05),
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(color: Colors.blue.withOpacity(0.2)),
+                            ),
+                            child: Row(
+                              children: [
+                                const Icon(Icons.timer, color: Colors.blue, size: 16),
+                                const SizedBox(width: 8),
+                                Text(
+                                  'Code valable 5 minutes - Vérifiez vos spams',
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    color: Colors.grey[600],
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(height: 16),
+                          
+                          // Bouton de retour
+                          TextButton.icon(
+                            onPressed: _resetLogin,
+                            icon: const Icon(Icons.arrow_back, size: 16),
+                            label: const Text('Modifier l\'email'),
+                            style: TextButton.styleFrom(
+                              foregroundColor: Colors.grey[600],
+                            ),
+                          ),
+                        ],
+                        
+                        const SizedBox(height: 24),
+                        
+                        // Bouton principal
+                        if (_isOtpSent)
+                          SizedBox(
+                            width: double.infinity,
+                            child: ElevatedButton.icon(
+                              onPressed: _isLoading ? null : _verifyOTP,
+                              icon: _isLoading
+                                  ? const SizedBox(
+                                      width: 20,
+                                      height: 20,
+                                      child: CircularProgressIndicator(
+                                        color: Colors.white,
+                                        strokeWidth: 2,
+                                      ),
+                                    )
+                                  : const Icon(Icons.check_circle),
+                              label: Text(_isLoading ? 'Vérification...' : 'Vérifier OTP'),
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: const Color(0xFF06616E),
+                                foregroundColor: Colors.white,
+                                padding: const EdgeInsets.symmetric(vertical: 16),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                              ),
+                            ),
+                          )
+                        else
+                          SizedBox(
+                            width: double.infinity,
+                            child: ElevatedButton.icon(
+                              onPressed: _isLoading ? null : _sendOTP,
+                              icon: _isLoading
+                                  ? const SizedBox(
+                                      width: 20,
+                                      height: 20,
+                                      child: CircularProgressIndicator(
+                                        color: Colors.white,
+                                        strokeWidth: 2,
+                                      ),
+                                    )
+                                  : const Icon(Icons.send),
+                              label: Text(_isLoading ? 'Envoi en cours...' : 'Recevoir le code OTP'),
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: const Color(0xFF06616E),
+                                foregroundColor: Colors.white,
+                                padding: const EdgeInsets.symmetric(vertical: 16),
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(12),
+                                ),
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ============================================
+// HOME SCREEN AVEC DÉCONNEXION
+// ============================================
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -58,6 +706,8 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> {
   int _selectedIndex = 0;
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
+  String _userEmail = '';
+  String _userName = '';
   
   // Version actuelle
   final String _currentVersion = '2.2.0';
@@ -79,22 +729,53 @@ class _HomeScreenState extends State<HomeScreen> {
     MenuItem(icon: Icons.dashboard, title: 'TOP par Dépt', color: const Color(0xFFEC4899)),
     MenuItem(icon: Icons.qr_code_scanner, title: 'Scanner Stock', color: const Color(0xFF8B5CF6)),
     MenuItem(icon: Icons.search, title: 'Recherche Article', color: const Color(0xFF06616E)),
-    MenuItem(icon: Icons.fingerprint, title: 'Empreinte Digital', color: const Color(0xFF8B5CF6)),
-   MenuItem(icon: Icons.warning_amber, title: 'Stock Négatif', color: const Color(0xFFEF4444)),
-MenuItem(icon: Icons.receipt, title: 'Top Tickets', color: const Color(0xFFF59E0B)),
-
+    MenuItem(icon: Icons.warning_amber, title: 'Stock Négatif', color: const Color(0xFFEF4444)),
+    MenuItem(icon: Icons.receipt, title: 'Top Tickets', color: const Color(0xFFF59E0B)),
   ];
 
   @override
   void initState() {
     super.initState();
-    // Vérification au démarrage
+    _loadUserInfo();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _checkForUpdates();
     });
   }
 
-  // Vérifier les mises à jour en direct sur version.json
+  Future<void> _loadUserInfo() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      setState(() {
+        _userEmail = prefs.getString('user_email') ?? '';
+        _userName = prefs.getString('user_name') ?? 'Utilisateur';
+      });
+    } catch (e) {
+      print('❌ Erreur chargement user info: $e');
+    }
+  }
+
+  // 🔓 Déconnexion
+  Future<void> _logout() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.remove('user_email');
+      await prefs.remove('user_name');
+      await prefs.remove('is_logged_in');
+      
+      print('🔓 Déconnexion réussie');
+      
+      Navigator.pushReplacement(
+        context,
+        MaterialPageRoute(
+          builder: (context) => const LoginScreen(),
+        ),
+      );
+    } catch (e) {
+      print('❌ Erreur déconnexion: $e');
+    }
+  }
+
+  // Vérifier les mises à jour
   Future<void> _checkForUpdates({bool showNoUpdateMessage = false}) async {
     if (!mounted) return;
     
@@ -118,7 +799,6 @@ MenuItem(icon: Icons.receipt, title: 'Top Tickets', color: const Color(0xFFF59E0
           _downloadUrl = _remoteVersion?['download_url'];
         });
         
-        // Afficher un message si l'utilisateur a demandé une vérification
         if (showNoUpdateMessage) {
           if (_updateAvailable) {
             _showUpdateDialog();
@@ -145,7 +825,6 @@ MenuItem(icon: Icons.receipt, title: 'Top Tickets', color: const Color(0xFFF59E0
     }
   }
 
-  // SnackBar d'information simple
   void _showInfoSnackBar(String title, String message) {
     if (!mounted) return;
     
@@ -168,7 +847,6 @@ MenuItem(icon: Icons.receipt, title: 'Top Tickets', color: const Color(0xFFF59E0
     );
   }
 
-  // Dialogue de mise à jour
   void _showUpdateDialog() {
     if (!mounted) return;
     
@@ -263,7 +941,6 @@ MenuItem(icon: Icons.receipt, title: 'Top Tickets', color: const Color(0xFFF59E0
     );
   }
 
-  // Ouvrir le lien de téléchargement
   Future<void> _launchUpdateUrl() async {
     if (!mounted) return;
     
@@ -330,7 +1007,6 @@ MenuItem(icon: Icons.receipt, title: 'Top Tickets', color: const Color(0xFFF59E0
     );
   }
 
-  // Dialogue pour copier le lien
   void _showCopyLinkDialog() {
     if (!mounted) return;
     
@@ -379,7 +1055,6 @@ MenuItem(icon: Icons.receipt, title: 'Top Tickets', color: const Color(0xFFF59E0
     );
   }
 
-  // Dialogue d'information de version
   void _showVersionInfo() {
     if (!mounted) return;
     
@@ -402,6 +1077,19 @@ MenuItem(icon: Icons.receipt, title: 'Top Tickets', color: const Color(0xFFF59E0
             children: [
               ListTile(
                 contentPadding: EdgeInsets.zero,
+                leading: const Icon(Icons.person),
+                title: const Text('Utilisateur'),
+                trailing: Text(_userName, style: const TextStyle(fontWeight: FontWeight.bold)),
+              ),
+              ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: const Icon(Icons.email),
+                title: const Text('Email'),
+                trailing: Text(_userEmail, style: const TextStyle(fontSize: 12)),
+              ),
+              const Divider(),
+              ListTile(
+                contentPadding: EdgeInsets.zero,
                 leading: const Icon(Icons.code),
                 title: const Text('Version'),
                 trailing: Text(_currentVersion, style: const TextStyle(fontWeight: FontWeight.bold)),
@@ -418,6 +1106,16 @@ MenuItem(icon: Icons.receipt, title: 'Top Tickets', color: const Color(0xFFF59E0
                         onPressed: () => _checkForUpdates(showNoUpdateMessage: true),
                         tooltip: 'Vérifier',
                       ),
+              ),
+              const Divider(),
+              ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: const Icon(Icons.logout, color: Colors.red),
+                title: const Text('Déconnexion', style: TextStyle(color: Colors.red)),
+                onTap: () {
+                  Navigator.of(context).pop();
+                  _logout();
+                },
               ),
             ],
           ),
@@ -454,6 +1152,32 @@ MenuItem(icon: Icons.receipt, title: 'Top Tickets', color: const Color(0xFFF59E0
           style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
         ),
         actions: [
+          if (_userName.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF06616E).withOpacity(0.1),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Icon(Icons.person, size: 14, color: Color(0xFF06616E)),
+                    const SizedBox(width: 4),
+                    Text(
+                      _userName,
+                      style: const TextStyle(
+                        fontSize: 12,
+                        color: Color(0xFF06616E),
+                        fontWeight: FontWeight.w500,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
           Stack(
             clipBehavior: Clip.none,
             children: [
@@ -518,8 +1242,14 @@ MenuItem(icon: Icons.receipt, title: 'Top Tickets', color: const Color(0xFFF59E0
                     ),
                     const SizedBox(height: 4),
                     Text(
-                      'Tableau de bord',
+                      'Bonjour ${_userName.isNotEmpty ? _userName : 'Utilisateur'}',
                       style: TextStyle(color: Colors.white.withOpacity(0.8)),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      _userEmail,
+                      style: TextStyle(color: Colors.white.withOpacity(0.6), fontSize: 11),
+                      overflow: TextOverflow.ellipsis,
                     ),
                   ],
                 ),
@@ -538,7 +1268,6 @@ MenuItem(icon: Icons.receipt, title: 'Top Tickets', color: const Color(0xFFF59E0
                   },
                 ),
               ),
-              // Version dans le footer du drawer
               Padding(
                 padding: const EdgeInsets.all(16),
                 child: Column(
@@ -600,6 +1329,22 @@ MenuItem(icon: Icons.receipt, title: 'Top Tickets', color: const Color(0xFFF59E0
                         ),
                       ),
                     ],
+                    const SizedBox(height: 8),
+                    SizedBox(
+                      width: double.infinity,
+                      child: TextButton.icon(
+                        onPressed: _logout,
+                        icon: const Icon(Icons.logout, color: Colors.red, size: 18),
+                        label: const Text('Déconnexion', style: TextStyle(color: Colors.red)),
+                        style: TextButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(vertical: 10),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(10),
+                            side: const BorderSide(color: Colors.red, width: 1),
+                          ),
+                        ),
+                      ),
+                    ),
                   ],
                 ),
               ),
@@ -667,10 +1412,8 @@ MenuItem(icon: Icons.receipt, title: 'Top Tickets', color: const Color(0xFFF59E0
       case 8:
         return const StockRotationScreen();
       case 9:
-        return const FingerprintEnrollmentScreen();
-      case 10:
         return const StockNegatifScreen();
-      case 11:
+      case 10:
         return const TicketsScreen();
       default:
         return const SizedBox();
@@ -691,7 +1434,7 @@ class MenuItem {
 }
 
 // ============================================
-// ÉCRAN D'ACCUEIL CORRIGÉ
+// ÉCRAN D'ACCUEIL
 // ============================================
 
 class HomeWelcomeScreen extends StatelessWidget {
@@ -720,7 +1463,6 @@ class HomeWelcomeScreen extends StatelessWidget {
           child: Column(
             mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              // Logo
               Container(
                 width: 80,
                 height: 80,
@@ -744,7 +1486,6 @@ class HomeWelcomeScreen extends StatelessWidget {
                 ),
               ),
               const SizedBox(height: 20),
-              
               const Text(
                 'USALES',
                 style: TextStyle(
@@ -770,10 +1511,7 @@ class HomeWelcomeScreen extends StatelessWidget {
                   ),
                 ),
               ),
-              
               const SizedBox(height: 32),
-              
-              // Divider
               Row(
                 children: [
                   Expanded(child: Divider(color: Colors.grey[300])),
@@ -791,9 +1529,7 @@ class HomeWelcomeScreen extends StatelessWidget {
                   Expanded(child: Divider(color: Colors.grey[300])),
                 ],
               ),
-              
               const SizedBox(height: 20),
-              
               const Text(
                 '📊 Fonctionnalités',
                 style: TextStyle(
@@ -803,8 +1539,6 @@ class HomeWelcomeScreen extends StatelessWidget {
                 ),
               ),
               const SizedBox(height: 20),
-              
-              // Grille des fonctionnalités
               LayoutBuilder(
                 builder: (context, constraints) {
                   final double cardWidth = (constraints.maxWidth - 16) / 2;
@@ -825,10 +1559,7 @@ class HomeWelcomeScreen extends StatelessWidget {
                   );
                 },
               ),
-              
               const SizedBox(height: 24),
-              
-              // Message de navigation
               Container(
                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
                 decoration: BoxDecoration(
